@@ -1,112 +1,103 @@
 ## IMPORTAÇÕES
-import requests, os, json
+import os
+import json
+import requests
 from dotenv import load_dotenv
-from mcp.server import MCPServer
-
-load_dotenv()  # Carrega as variáveis de ambiente do arquivo .env
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_API_TOKEN = os.getenv("SUPABASE_API_TOKEN")
-SUPABASE_REF_PROJECT = os.getenv("SUPABASE_REF_PROJECT")
-
-## FUNÇÕES
-
-mcp = MCPServer('Supabase')
-
 from mcp.server.mcpserver import MCPServer
+
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_API_TOKEN = os.getenv("SUPABASE_API_TOKEN", "")
+SUPABASE_REF_PROJECT = os.getenv("SUPABASE_REF_PROJECT", "")
+
+# Garante a URL base correta do projeto Supabase
+if not SUPABASE_URL:
+    if SUPABASE_REF_PROJECT:
+        SUPABASE_URL = f"https://{SUPABASE_REF_PROJECT}.supabase.co"
+elif "api.supabase.com" in SUPABASE_URL and SUPABASE_REF_PROJECT:
+    SUPABASE_URL = f"https://{SUPABASE_REF_PROJECT}.supabase.co"
 
 mcp = MCPServer("supabase")
 
-def buscar_docs(sql) -> list:
-     # Requisição ao Supabase
-        response = requests.post(
-            f"{SUPABASE_URL}/{SUPABASE_REF_PROJECT}/database/query",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {SUPABASE_API_TOKEN}"
-            },
-            json={
-                "query": f"{sql}",
-                "read_only": True
-            }
-        )   
-        #response.raise_for_status()  
-        data = response.json()
-        return data
-       
+
+def _get_headers() -> dict:
+    return {
+        "apikey": SUPABASE_API_TOKEN,
+        "Authorization": f"Bearer {SUPABASE_API_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def buscar_docs_rest(endpoint: str, params: dict | None = None) -> list | dict:
+    """Realiza requisições HTTP GET na API REST (PostgREST) do Supabase."""
+    url = f"{SUPABASE_URL}/rest/v1/{endpoint.lstrip('/')}"
+    response = requests.get(url, headers=_get_headers(), params=params)
+    response.raise_for_status()
+    return response.json()
+
 
 @mcp.tool()
 def listar_documentos(limite: int = 20) -> list:
-    """Lista os documentos mais recentes, com limite entre 1 e 100."""
+    """Lista os documentos mais recentes da base de dados do RAG (tabela documents)."""
     if not 1 <= limite <= 100:
         raise ValueError("O limite deve estar entre 1 e 100.")
-    sql = f"""
-          SELECT
-              id,
-              nome_arquivo,
-              categoria,
-              status,
-              percentual_sucesso,
-              criado_em
-          FROM public.documentos
-          ORDER BY criado_em DESC
-          LIMIT {limite};
-    """
-    return buscar_docs(sql) 
 
-@mcp.resource("supabase://documentos/schema")
+    params = {
+        "select": "id,content,metadata",
+        "limit": limite,
+    }
+    return buscar_docs_rest("documents", params=params)
+
+
+@mcp.tool()
+def pesquisar_documentos(termo: str, limite: int = 10) -> list:
+    """Pesquisa documentos pelo texto do conteudo (filtro ilike) na base RAG."""
+    if not 1 <= limite <= 100:
+        raise ValueError("O limite deve estar entre 1 e 100.")
+
+    params = {
+        "select": "id,content,metadata",
+        "content": f"ilike.*{termo}*",
+        "limit": limite,
+    }
+    return buscar_docs_rest("documents", params=params)
+
+
+@mcp.resource("supabase://documents/schema")
 def descrever_documentos() -> str:
-    """Retorna os metadados atuais da tabela public.documentos."""
-    sql = """
-        SELECT
-            column_name,
-            data_type,
-            character_maximum_length,
-            is_nullable,
-            column_default
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'documentos'
-        ORDER BY ordinal_position;
-    """
+    """Retorna a estrutura dos campos da tabela documents do RAG."""
+    schema_info = {
+        "tabela": "public.documents",
+        "descricao": "Tabela de documentos e chunks do banco RAG.",
+        "campos": [
+            {"nome": "id", "tipo": "bigint/uuid", "descricao": "Identificador do documento"},
+            {"nome": "content", "tipo": "text", "descricao": "Texto / conteúdo do documento ou chunk"},
+            {"nome": "metadata", "tipo": "jsonb", "descricao": "Metadados adicionais (fonte, página, autor, etc.)"},
+            {"nome": "embedding", "tipo": "vector", "descricao": "Vetor de embeddings para busca semântica"},
+        ],
+    }
+    return json.dumps(schema_info, indent=4, ensure_ascii=False)
 
-    colunas = buscar_docs(sql)
-
-    if not colunas:
-        raise RuntimeError("Não foi possível encontrar o schema de public.documentos.")
-
-    return json.dumps(
-        {
-            "tabela": "public.documentos",
-            "descricao": "Metadados dos documentos processados.",
-            "colunas": colunas,
-        },
-        indent=4,
-        ensure_ascii=False,
-    )
 
 @mcp.prompt()
 def consultar_documentos(pergunta: str) -> str:
-    """Orienta a consulta e a explicação dos metadados dos documentos."""
+    """Orienta a consulta e a explicacao sobre os documentos do banco RAG."""
     return f"""
-    Você é um assistente que responde perguntas sobre os documentos registrados
-    na tabela public.documentos.
+    Você é um assistente que responde perguntas sobre os documentos do banco de dados RAG
+    armazenados no Supabase na tabela public.documents.
 
     Pergunta do usuário: {pergunta}
 
-    Consulte os dados usando a tool listar_documentos.
-    Use supabase://documentos/schema como referência para interpretar os campos.
+    Para buscar informações:
+    1. Utilize a tool `pesquisar_documentos` para procurar por termos-chave.
+    2. Utilize a tool `listar_documentos` para obter a listagem dos documentos.
+    3. Consulte `supabase://documents/schema` se precisar entender a estrutura dos campos.
 
-    Responda em português, de forma clara e concisa. Baseie a resposta somente
-    nos dados retornados pelas tools. Não invente informações e informe quando
-    os dados consultados não forem suficientes para responder.
+    Responda em português, de forma clara e objetiva com base apenas nos dados retornados.
     """
 
 
-
-## CHAMAR A FUNÇÃO
-
 if __name__ == "__main__":
-    #resultado = consultar_documentos()
-    #print(resultado)
-    mcp.run(transport="stdio")
+    mcp.run(transport="stdio")
